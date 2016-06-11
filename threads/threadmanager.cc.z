@@ -1,0 +1,431 @@
+#include "threadmanager.h"
+#include "synch.h"
+#include "thread.h"
+
+PCB::PCB()
+{
+    joinsem = new Semaphore("[PCB] Join semaphore", 0);
+    exitsem = new Semaphore("[PCB] Exit semaphore", 0);
+    mutex = new Semaphore("[PCB] Mutex ", 1);
+
+    exitcode = 0;
+    numwait = 0;
+    parentID = -1;
+    isForeground = true;		// When a program interact directly with user
+								// through shell, its running mode is called foreground
+								// Background programs is programs that don't interact with
+								// user though shell. If user want to see its output,
+								// or configuration, they have to open file created by that program,
+								// usually called log file, conf file,...
+}
+
+PCB::PCB(int id)
+{
+    joinsem = new Semaphore("[PCB] Join semaphore", 0);
+    exitsem = new Semaphore("[PCB] Exit semaphore", 0);
+    mutex = new Semaphore("[PCB] Mutex ", 1);
+
+    exitcode = 0;
+    numwait = 0;
+
+    thread = NULL;
+    pid = id;
+	isForeground = true;
+
+    if (id != 0)
+        parentID = currentThread->getPID();
+    else parentID = 0;
+}
+
+PCB::~PCB()
+{
+    delete joinsem;
+    delete exitsem;
+    delete mutex;
+
+    if (thread != NULL)
+    {
+        thread->freeSpace();
+        thread->Finish();
+    }
+}
+
+int PCB::Exec(char *filename, int pid)
+{
+    mutex->P();
+
+    thread = new Thread(filename);
+    if (thread == NULL)
+    {
+        printf("PCB::exec() -> Out of memory to create new thread !\n");
+        mutex->V();
+        return -1;
+    }
+
+    thread->processID = pid;
+	parentID = currentThread->processID;
+	thread->Fork(_StartProcess, pid);
+	mutex->V();
+
+	return pid;
+}
+
+int PCB::GetID()
+{
+    return pid;
+}
+
+int PCB::GetNumWait()
+{
+    return numwait;
+}
+
+void PCB::JoinWait()
+{
+    joinsem->P();
+}
+
+void PCB::ExitWait()
+{
+    exitsem->P();
+}
+
+void PCB::JoinRelease()
+{
+    joinsem->V();
+}
+
+void PCB::ExitRelease()
+{
+    exitsem->V();
+}
+
+void PCB::IncNumWait()
+{
+    mutex->P();
+    numwait++;
+    mutex->V();
+}
+
+void PCB::DecNumWait()
+{
+    mutex->P();
+    if (numwait > 0) numwait--;
+    mutex->V();
+}
+
+void PCB::SetExitCode(int ec)
+{
+    exitcode = ec;
+}
+
+int PCB::GetExitCode()
+{
+    return exitcode;
+}
+
+void PCB::SetFileName(char* fn)
+{
+    strcpy(pName, fn);
+}
+
+char* PCB::GetFileName()
+{
+    return pName;
+}
+
+
+void _StartProcess(int pid)
+{
+	char *getName = pTab->GetName(pid);
+
+	AddrSpace *space = new AddrSpace(getName);
+
+	// Load memory of created process into memory
+	currentThread->space = space;
+	currentThread->space->InitRegisters();
+	currentThread->space->RestoreState();
+
+	// Switch to user mode to execute the process
+   	machine->Run();
+
+   	ASSERT(FALSE);
+    if (getName != NULL) delete getName;
+}
+
+
+
+
+/*********************************
+
+           Process Table
+
+**********************************/
+
+
+
+PTable::PTable(int size)
+{
+    bm = new BitMap(size);
+    bm->Mark(0);
+    bmsem = new Semaphore("[PTable] Bitmap Semaphore", 1);
+
+    pcb[0] = new PCB(0);
+    pcb[0]->parentID = -1;
+    pcb[0]->SetFileName(SHELL_PATH);
+    for (int i = 1; i < MAX_PROCESS; i++)
+        pcb[i] = NULL;
+    psize = size;
+}
+
+PTable::~PTable()
+{
+	delete bmsem;
+	delete bm;
+
+    for(int i = 0; i <psize ; i++)
+        if (pcb[i] != NULL)
+        {
+            delete pcb[i];
+            pcb[i] = NULL;
+        }
+}
+
+int PTable::ExecUpdate(char* name)
+{
+	bmsem->P();
+
+	OpenFile *f = fileSystem->Open(name);
+	if (f == NULL)
+	{
+		printf("PTable::ExecUpdate() -> Can't open file %s\n", name);
+		bmsem->V();
+		return -1;
+	}
+	delete f;
+
+	if ((strcmp(name, currentThread->getName()) == 0) ||
+	   (strcmp(name, SHELL_PATH) == 0))
+	{
+		printf("PTable::ExecUpdate() -> Program %s can't call itself\n");
+		bmsem->V();
+		return -1;
+	}
+
+	int freeSlot = PTable::GetFreeSlot();
+
+	if (freeSlot == -1)
+	{
+		printf ("PTable::ExecUpdate() -> Full slot\n");
+		bmsem->V();
+		return -1;
+	}
+
+	if (freeSlot < 0 || freeSlot > MAX_PROCESS-1)
+	{
+		printf ("PTable::ExecUpdate() -> Can't load more %d program\n", MAX_PROCESS);
+		bmsem->V();
+		return -1;
+	}
+
+	pcb[freeSlot] = new PCB(freeSlot);
+	pcb[freeSlot]->SetFileName(name);
+	int pid = pcb[freeSlot]->Exec(name, freeSlot);
+
+	bmsem->V();
+	return pid;
+}
+
+int PTable::ExitUpdate(int ec)
+{
+	int pid = currentThread->processID;
+
+	if (pid == 0)
+	{
+		 interrupt->Halt();
+		 return -1;
+	}
+
+	if (!PTable::IsExist(pid))
+	{
+		 printf("PTable::ExitUpdate() -> pid %d isn't exist\n", pid);
+		 return -1;
+	}
+
+	//kiem tra co chay background hay ko ?
+	if (pcb[id]->isForeground)
+	{
+		Remove(id);
+		return 0;
+	}
+
+	// When a process is finish, it return its exitcode, need to unload
+	// to load other process -> number of waiting process is decreased
+	// because one process is loaded after the termination of this process
+	pcb[pid]->SetExitCode(ec);
+	pcb[pid]->JoinRelease();
+	pcb[pcb[pid]->parentID]->DecNumWait();
+	pcb[pid]->ExitWait();
+
+	PTable::Remove(pid);
+
+	return ec;
+}
+
+int PTable::JoinUpdate(int id)
+{
+	if (pid < 0 || pid > MAX_PROCESS-1)
+	{
+		printf("PTable::JoinUpdate() -> pid %d not exist\n", pid);
+		return -1;
+	}
+
+	if (currentThread->processID != pcb[pid]->parentID)
+	{
+		printf("PTable::JoinUpdate() -> Must join to parent process\n");
+		return -1;
+	}
+
+	pcb[pcb[pid]->parentID]->IncNumWait();
+	pcb[pid]->JoinWait();
+	pcb[pid]->isForeground = false;			// bring this process to background mode
+
+	int ec = pcb[pid]->GetExitCode();
+	pcb[pid]->ExitRelease();
+
+	return ec;
+}
+
+int PTable::GetFreeSlot()
+{
+    return bm->Find();
+}
+
+bool PTable::IsExist(int pid)
+{
+	if ((pID < 0) || (pID > MAX_PROCESS-1))
+		return false;
+    else return bm->Test(pid);
+}
+
+void PTable::Remove(int pid)
+{
+	if ((pid < 0) || (pid > MAX_PROCESS-1))
+		return;
+
+	if (bm->Test(pid))
+	{
+		bm->Clear(pid);
+
+		delete pcb[pid];
+		pcb[pid] = NULL;
+	}
+}
+
+char* PTable::GetFileName(int pid)
+{
+	if (PTable::IsExist(pid))
+		return pcb[pid]->GetFileName();
+}
+
+
+/**********************************
+
+			Semaphore
+
+**********************************/
+
+
+Sem::Sem(char* na, int i)
+{
+    strcpy(this->name, na);
+    sem = new Semaphore(name,i);
+}
+
+Sem::~Sem()
+{
+    delete sem;
+}
+
+void Sem::wait()
+{
+    sem->P();
+
+}
+
+void Sem::signal()
+{
+    sem->V();
+
+}
+
+char* Sem::GetName()
+{
+    return name;
+}
+
+
+/**********************************
+
+		Semaphore Table
+
+**********************************/
+
+STable::STable()
+{
+	bm = new BitMap(MAX_SEMAPHORE);
+	for (int i = 0; i < MAX_SEMAPHORE ; i++)
+		semTab[i] = NULL;
+}
+
+STable::~STable()
+{
+	delete bm;
+    for (int i = 0; i < MAX_SEMAPHORE; i++)
+		if (semTab[i] != NULL)
+			delete semTab[i];
+}
+
+int STable::Create(char* name, int init)
+{
+    int id = bm->Find();
+
+    if (id < 0) return -1;
+    else
+    {
+		semTab[id] = new Semaphore(name, init);
+		return 0;
+    }
+}
+
+int STable::Wait(char* name)
+{
+	for (int i = 0; i < MAX_SEMAPHORE; i++)
+		if (bm->Test(i))
+		if(strcmp(semTab[i]->GetName(), name) == 0)
+		{
+			semTab[i]->wait();
+			return 0;
+		}
+
+	return -1;
+}
+
+
+int STable::Signal(char* name)
+{
+	for (int i = 0; i < MAX_SEMAPHORE; i++)
+		if (bm->Test(i))
+		if(strcmp(semTab[i]->GetName(), name) == 0)
+		{
+			semTab[i]->signal();
+			return 0;
+		}
+
+	return -1;
+}
+
+int STable::FindFreeSlot(int id)
+{
+    return bm->Find();
+}
